@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 EPS = 1e-10
 DEFAULT_MINIMUM_NOISE_VAR = 1e-6
+_BEST_UNDISTURBED_PARAMS_KEY = "undisturbed_params"
 _BEST_ACQF_KEY = "best_acqf_val"
 
 
@@ -194,7 +195,7 @@ class CARBOSampler(BaseSampler):
         else:
             warmstart_index = None
         best_params = None if warmstart_index is None else X_train[warmstart_index].numpy()
-        found_best_params, best_acqf_val = suggest_by_carbo(
+        found_best_params, found_best_params_disturbed, best_acqf_val = suggest_by_carbo(
             gpr=gpr,
             constraints_gpr_list=constraints_gpr_list,
             constraints_threshold_list=constraints_threshold_list,
@@ -205,12 +206,21 @@ class CARBOSampler(BaseSampler):
             n_local_search=self._n_local_search,
             local_radius=self._local_ratio / 2,
         )
-        study._storage.set_trial_system_attr(trial._trial_id, _BEST_ACQF_KEY, best_acqf_val)
         lows, highs, is_log = _get_dist_info_as_arrays(search_space)
+        study._storage.set_trial_system_attr(
+            trial._trial_id, _BEST_UNDISTURBED_PARAMS_KEY,
+            {
+                name: float(param_value)
+                for name, param_value in zip(
+                        search_space, unnormalize_params(found_best_params[None], is_log, lows, highs)[0]
+                )
+            }
+        )
+        study._storage.set_trial_system_attr(trial._trial_id, _BEST_ACQF_KEY, best_acqf_val)
         return {
             name: float(param_value)
             for name, param_value in zip(
-                search_space, unnormalize_params(found_best_params[None], is_log, lows, highs)[0]
+                search_space, unnormalize_params(found_best_params_disturbed[None], is_log, lows, highs)[0]
             )
         }
 
@@ -246,6 +256,12 @@ class CARBOSampler(BaseSampler):
             [t.system_attrs.get(_BEST_ACQF_KEY, -np.inf) for t in complete_trials]
         )
         return complete_trials[best_idx]
+
+    def get_undisturbed_params(self, trial: FrozenTrial) -> dict[str, float]:
+        if _BEST_UNDISTURBED_PARAMS_KEY in trial.system_attrs:
+            return trial.system_attrs[_BEST_UNDISTURBED_PARAMS_KEY]
+        else:
+            return trial.params
 
     def sample_independent(
         self,
