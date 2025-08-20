@@ -194,8 +194,13 @@ class CARBOSampler(BaseSampler):
         else:
             warmstart_index = None
         best_params = None if warmstart_index is None else X_train[warmstart_index].numpy()
+        if constraints_gpr_list is None:
+            func_index = 0
+        else:
+            func_index = trial.number % (1 + len(constraints_gpr_list))
         found_best_params, best_acqf_val = suggest_by_carbo(
             gpr=gpr,
+            func_index=func_index,
             constraints_gpr_list=constraints_gpr_list,
             constraints_threshold_list=constraints_threshold_list,
             best_params=best_params,

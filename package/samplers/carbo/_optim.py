@@ -10,6 +10,7 @@ import scipy.stats.qmc as qmc
 from ._acqf import BaseAcquisitionFunc
 from ._acqf import CombinedLCB
 from ._acqf import CombinedUCB
+from ._acqf import LCB
 from ._gp import GPRegressor
 from ._scipy_blas_thread_patch import single_blas_thread_if_scipy_v1_15_or_newer
 
@@ -62,6 +63,7 @@ def _create_bounds(x_local: np.ndarray, local_radius: float) -> np.ndarray:
 def suggest_by_carbo(
     *,
     gpr: GPRegressor,
+    func_index: int,
     constraints_gpr_list: list[GPRegressor] | None,
     constraints_threshold_list: list[float] | None,
     best_params: np.ndarray | None,
@@ -97,13 +99,20 @@ def suggest_by_carbo(
             robust_x_local = x_local.copy()
             robust_f_local = f
 
-    lcb_acqf = CombinedLCB(
+    assert isinstance(robust_x_local, np.ndarray)
+    bounds = _create_bounds(robust_x_local, local_radius)
+
+    if func_index == 0:
+        lcb_acqf = LCB(gpr, beta)
+    else:
+        lcb_acqf = LCB(constraints_gpr_list[func_index - 1], beta)
+    disturbed_x, disturbed_val = _gradient_descent(lcb_acqf, robust_x_local, bounds, tol=tol)
+
+    lcb_acqf_final = CombinedLCB(
         gpr=gpr,
         constraints_gpr_list=constraints_gpr_list,
         constraints_threshold_list=constraints_threshold_list,
         rho=rho,
         beta=beta,
     )
-    assert isinstance(robust_x_local, np.ndarray)
-    bounds = _create_bounds(robust_x_local, local_radius)
-    return _gradient_descent(lcb_acqf, robust_x_local, bounds, tol=tol)
+    return disturbed_x, _gradient_descent(lcb_acqf_final, robust_x_local, bounds, tol=tol)[1]
