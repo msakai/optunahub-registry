@@ -113,7 +113,7 @@ def evaluate_by_carbo(
     n_local_search: int,
     local_radius: float,
     tol: float = 1e-4,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float, float]:
     lcb_acqf = CombinedLCB(
         gpr=gpr,
         constraints_gpr_list=constraints_gpr_list,
@@ -122,4 +122,4 @@ def evaluate_by_carbo(
         beta=beta,
     )
     bounds = _create_bounds(robust_params, local_radius)
-    return _gradient_descent(lcb_acqf, robust_params, bounds, tol=tol)
+    return *_gradient_descent(lcb_acqf, robust_params, bounds, tol=tol), float(lcb_acqf.eval_acqf_no_grad(robust_params.copy()))

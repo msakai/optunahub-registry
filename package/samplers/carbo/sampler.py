@@ -349,7 +349,7 @@ class CARBOSampler(BaseSampler):
         results = []
 
         for i, trial in enumerate(trials):
-            worst_robust_params, worst_robust_acqf_val = evaluate_by_carbo(
+            worst_robust_params, worst_robust_acqf_val, initial_robust_acqf_val = evaluate_by_carbo(
                 robust_params=robust_params[i],
                 gpr=gpr,
                 constraints_gpr_list=constraints_gpr_list,
@@ -374,6 +374,7 @@ class CARBOSampler(BaseSampler):
                     )
                 },
                 "worst_robust_acqf_val": worst_robust_acqf_val,
+                "initial_robust_acqf_val": initial_robust_acqf_val,
             }
 
             results.append(result)
