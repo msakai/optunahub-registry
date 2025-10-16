@@ -285,6 +285,74 @@ class CARBOSampler(BaseSampler):
             _process_constraints_after_trial(self._constraints_func, study, trial, state)
         self._independent_sampler.after_trial(study, trial, state, values)
 
+    def get_gp_evaluator(
+        self,
+        study: Study,
+    ) -> GPEvaluator:
+        if study._is_multi_objective():
+            raise ValueError("CARBOSampler does not support multi-objective optimization.")
+
+        trials = study._get_trials(deepcopy=False, states=(TrialState.COMPLETE,), use_cache=True)
+        search_space = self.infer_relative_search_space(study, trials[0])
+
+        X_train, y_train = self._preproc(study, trials, search_space)
+        gpr = GPRegressor(
+            X_train, y_train, kernel_params=self._kernel_params_cache
+        ).fit_kernel_params(self._log_prior, self._minimum_noise, self._deterministic)
+
+        # XXX: These are already computed in self._preproc
+        sign = -1.0 if study.direction == StudyDirection.MINIMIZE else 1.0
+        _, means, stds = _standardize_values(sign * np.array([trial.value for trial in trials]))
+
+        return GPEvaluator(
+            gpr=gpr,
+            search_space=search_space,
+            sign=sign,
+            mean=float(means),
+            std=float(stds),
+        )
+
+    def get_constraints_gp_evaluators(
+        self,
+        study: Study,
+    ) -> tuple[GPEvaluator, ...]:
+        if study._is_multi_objective():
+            raise ValueError("CARBOSampler does not support multi-objective optimization.")
+
+        trials = study._get_trials(deepcopy=False, states=(TrialState.COMPLETE,), use_cache=True)
+        search_space = self.infer_relative_search_space(study, trials[0])
+
+        if self._constraints_func is None:
+            return tuple()
+
+        X_train, _ = self._preproc(study, trials, search_space)
+        constraint_vals = _get_constraint_vals(study, trials)
+
+        _cache_list = (
+            self._constraints_kernel_params_cache_list
+            if self._constraints_kernel_params_cache_list is not None
+            else [None] * constraint_vals.shape[-1]  # type: ignore[list-item]
+        )
+        stded_c_vals, c_vals_means, c_vals_stdevs = _standardize_values(-constraint_vals)
+        C_train = torch.from_numpy(stded_c_vals)
+        constraints_gpr_list = [
+            GPRegressor(X_train, c_train, kernel_params=cache).fit_kernel_params(
+                self._log_prior, self._minimum_noise, self._deterministic
+            )
+            for cache, c_train in zip(_cache_list, C_train.T)
+        ]
+
+        return tuple(
+            GPEvaluator(
+                gpr=gpr,
+                search_space=search_space,
+                sign=-1.0,
+                mean=float(c_vals_means[i]),
+                std=float(c_vals_stdevs[i]),
+            )
+            for i, gpr in enumerate(constraints_gpr_list)
+        )
+
 
 def _get_constraint_vals(study: Study, trials: list[FrozenTrial]) -> np.ndarray:
     _constraint_vals = [
@@ -297,3 +365,34 @@ def _get_constraint_vals(study: Study, trials: list[FrozenTrial]) -> np.ndarray:
     constraint_vals = np.array(_constraint_vals)
     assert len(constraint_vals.shape) == 2, "constraint_vals must be a 2d array."
     return constraint_vals
+
+
+class GPEvaluator:
+    def __init__(
+        self,
+        gpr: GPRegressor,
+        search_space: dict[str, BaseDistribution],
+        sign: float,
+        mean: float,
+        std: float,
+    ) -> None:
+        self._gpr = gpr
+        self._search_space = search_space
+        self._lows, self._highs, self._is_log = _get_dist_info_as_arrays(search_space)
+        self._sign = sign
+        self._mean = mean
+        self._std = std
+
+    def __call__(self, params: dict[str, Any], *, normalize: bool = False) -> tuple[float, float]:
+        params_array = np.empty((1, len(self._search_space)), dtype=float)
+        for d, (name, dist) in enumerate(self._search_space.items()):
+            params_array[0, d] = params[name]
+        params_array = normalize_params(params_array, self._is_log, self._lows, self._highs)
+
+        mean, var = self._gpr.posterior(torch.from_numpy(params_array))
+        if normalize:
+            return float(mean.detach().numpy()), float(var.detach().numpy())
+        else:
+            return self._sign * float(
+                mean.detach().numpy() * np.maximum(EPS, self._std) + self._mean
+            ), float(var.detach().numpy() * np.maximum(EPS, self._std) ** 2)
