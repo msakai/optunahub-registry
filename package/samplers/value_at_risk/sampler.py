@@ -717,6 +717,65 @@ class RobustGPSampler(BaseSampler):
             _process_constraints_after_trial(self._constraints_func, study, trial, state)
         self._independent_sampler.after_trial(study, trial, state, values)
 
+    def get_gp_evaluator(
+        self,
+        study: Study,
+    ) -> GPEvaluator:
+        if study._is_multi_objective():
+            raise ValueError("CARBOSampler does not support multi-objective optimization.")
+
+        states = (TrialState.COMPLETE,)
+        trials = study._get_trials(deepcopy=False, states=states, use_cache=True)
+        search_space = self.infer_relative_search_space(study, trials[0])
+        gpr = self._get_gpr_list(study, search_space)[0]
+        internal_search_space = gp_search_space.SearchSpace(search_space)
+
+        signs = np.array([-1.0 if d == StudyDirection.MINIMIZE else 1.0 for d in study.directions])
+        standardized_score_vals, means, stds = _standardize_values(
+            signs * np.array([trial.values for trial in trials])
+        )
+
+        return GPEvaluator(
+            gpr=gpr,
+            search_space=search_space,
+            sign=float(signs[0]),
+            mean=float(means[0]),
+            std=float(stds[0]),
+        )
+
+    def get_constraints_gp_evaluators(
+        self,
+        study: Study,
+    ) -> tuple[GPEvaluator, ...]:
+        states = (TrialState.COMPLETE,)
+        trials = study._get_trials(deepcopy=False, states=states, use_cache=True)
+        search_space = self.infer_relative_search_space(study, trials[0])
+        gpr = self._get_gpr_list(study, search_space)[0]
+        internal_search_space = gp_search_space.SearchSpace(search_space)
+
+        if self._constraints_func is None:
+            return tuple()
+
+        constraint_vals, _ = _get_constraint_vals_and_feasibility(study, trials)
+        constr_gpr_list, _constr_threshold_list = self._get_constraints_acqf_args(
+            constraint_vals,
+            internal_search_space,
+            internal_search_space.get_normalized_params(trials),
+        )
+
+        _standardized_constraint_vals, means, stds = _standardize_values(-constraint_vals)
+
+        return tuple(
+            GPEvaluator(
+                gpr=gpr,
+                search_space=search_space,
+                sign=-1.0,
+                mean=float(means[i]),
+                std=float(stds[i]),
+            )
+            for i, gpr in enumerate(constr_gpr_list)
+        )
+
 
 def _get_constraint_vals_and_feasibility(
     study: Study, trials: list[FrozenTrial]
@@ -733,3 +792,60 @@ def _get_constraint_vals_and_feasibility(
     is_feasible = np.all(constraint_vals <= 0, axis=1)
     assert not isinstance(is_feasible, np.bool_), "MyPy Redefinition for NumPy v2.2.0."
     return constraint_vals, is_feasible
+
+
+def _get_dist_info_as_arrays(
+    search_space: dict[str, BaseDistribution],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    dim = len(search_space)
+    is_log = np.zeros(dim, dtype=bool)
+    lows = np.empty(dim, dtype=float)
+    highs = np.empty(dim, dtype=float)
+    for d, dist in enumerate(search_space.values()):
+        assert isinstance(dist, optuna.distributions.FloatDistribution)
+        is_log[d] = dist.log
+        lows[d] = dist.low
+        highs[d] = dist.high
+    return lows, highs, is_log
+
+
+def normalize_params(
+    params: np.ndarray, is_log: np.ndarray, lows: np.ndarray, highs: np.ndarray
+) -> np.ndarray:
+    assert len(params.shape) == 2
+    results = (params - lows) / (highs - lows)
+    log_lows = np.log(lows[is_log])
+    log_highs = np.log(highs[is_log])
+    results[:, is_log] = (np.log(params[:, is_log]) - log_lows) / (log_highs - log_lows)
+    return results
+
+
+class GPEvaluator:
+    def __init__(
+        self,
+        gpr: gp.GPRegressor,
+        search_space: dict[str, BaseDistribution],
+        sign: float,
+        mean: float,
+        std: float,
+    ) -> None:
+        self._gpr = gpr
+        self._search_space = search_space
+        self._lows, self._highs, self._is_log = _get_dist_info_as_arrays(search_space)
+        self._sign = sign
+        self._mean = mean
+        self._std = std
+
+    def __call__(self, params: dict[str, Any], *, normalize: bool = False) -> tuple[float, float]:
+        params_array = np.empty((1, len(self._search_space)), dtype=float)
+        for d, (name, dist) in enumerate(self._search_space.items()):
+            params_array[0, d] = params[name]
+        params_array = normalize_params(params_array, self._is_log, self._lows, self._highs)
+
+        mean, var = self._gpr.posterior(torch.from_numpy(params_array))
+        if normalize:
+            return float(mean.detach().numpy()), float(var.detach().numpy())
+        else:
+            return self._sign * float(
+                mean.detach().numpy() * np.maximum(EPS, self._std) + self._mean
+            ), float(var.detach().numpy() * np.maximum(EPS, self._std) ** 2)
